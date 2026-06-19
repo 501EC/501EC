@@ -204,12 +204,47 @@ class ClaudeGadget:
         sw = r.winfo_screenwidth()
         r.geometry(f"{self.W}x{self.H}+{sw - self.W - 16}+40")
         r.overrideredirect(True)
-        r.attributes("-topmost", True)
+        r.attributes("-topmost", False)   # NOT always on top
         r.attributes("-alpha", 0.95)
-        r.lift()
-        r.after(100, lambda: r.attributes("-topmost", True))
+        r.update()
+        self._sink_to_desktop()           # hide from taskbar + sit behind apps
         r.bind("<Button-1>",  self._drag_start)
         r.bind("<B1-Motion>", self._drag_move)
+        r.bind("<ButtonRelease-1>", lambda e: self._sink_to_desktop())
+
+    def _sink_to_desktop(self):
+        """
+        Use Win32 API to:
+          1. Hide the window from the taskbar and Alt+Tab (WS_EX_TOOLWINDOW).
+          2. Send it to the bottom of the z-order so every app window sits above it.
+        This makes the gadget behave like a desktop widget — visible only
+        when no other window is covering the desktop area.
+        """
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            if not hwnd:
+                hwnd = self.root.winfo_id()
+
+            # --- hide from taskbar ---
+            GWL_EXSTYLE      = -20
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_APPWINDOW  = 0x00040000
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            ctypes.windll.user32.SetWindowLongW(
+                hwnd, GWL_EXSTYLE,
+                (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW)
+
+            # --- send to bottom of z-order (behind all app windows) ---
+            HWND_BOTTOM    = 1
+            SWP_NOMOVE     = 0x0002
+            SWP_NOSIZE     = 0x0001
+            SWP_NOACTIVATE = 0x0010
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        except Exception:
+            pass   # non-Windows platform — silently skip
 
     # ── ui ───────────────────────────────────────────────────────────────────
 
