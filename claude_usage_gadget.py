@@ -207,16 +207,22 @@ class ClaudeGadget:
     def _setup_window(self):
         r = self.root
         r.title("Claude Usage")
-        r.overrideredirect(True)         # frameless
-        r.attributes("-topmost", True)   # always on top
-        r.attributes("-alpha", 0.94)     # slight transparency
         r.configure(bg=C["bg"])
         r.resizable(False, False)
 
-        # Start: top-right corner, 20 px from edge
-        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
-        x = sw - self.W - 20
-        r.geometry(f"{self.W}x{self.H}+{x}+40")
+        # Position: top-right corner, 20 px from edge
+        r.update_idletasks()
+        sw = r.winfo_screenwidth()
+        r.geometry(f"{self.W}x{self.H}+{sw - self.W - 20}+40")
+
+        # Go frameless after geometry is set (avoids invisible-window bug)
+        r.overrideredirect(True)
+        r.attributes("-topmost", True)
+        r.attributes("-alpha", 0.94)
+
+        # Force the window to the front
+        r.lift()
+        r.after(100, lambda: r.attributes("-topmost", True))
 
         # Drag support
         r.bind("<Button-1>",   self._drag_start)
