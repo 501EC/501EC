@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """
-Claude Code Usage Monitor — Floating Desktop Gadget (Windows x64)
-Reads local Claude Code session files and shows live token/cost usage.
-Right-click the gadget to access settings or exit.
-Drag anywhere to reposition.
+Claude Code Usage Monitor — Compact Desktop Gadget (Windows x64)
+Segmented horizontal bars: usage (blue) + remaining (green) vs limit.
+Drag to move. Right-click for options.
 """
 
 import tkinter as tk
 import json
 import os
-from datetime import date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  CONFIG  (edit these to match your plan / budget)
+#  CONFIG  — edit to match your plan
 # ─────────────────────────────────────────────────────────────────────────────
-REFRESH_INTERVAL_MS = 60_000      # How often to re-scan (ms). 60 000 = 1 min.
-MONTHLY_COST_LIMIT_USD = 50.0     # Your monthly budget in USD.
-DAILY_TOKEN_LIMIT = 1_500_000     # Soft daily token ceiling (for the bar).
+REFRESH_INTERVAL_MS = 60_000     # 60 s between refreshes
+MONTHLY_COST_LIMIT  = 20.0       # USD monthly budget
+DAILY_TOKEN_LIMIT   = 1_000_000  # tokens per day
+RESET_HOUR          = 0          # hour when daily limit resets (0 = midnight)
 
-# Anthropic API pricing — USD per 1 M tokens (Sonnet 4.x default)
 PRICING = {
     "input":       3.00,
     "output":     15.00,
@@ -33,294 +32,326 @@ PRICING = {
 C = {
     "bg":      "#0d1117",
     "bg2":     "#161b22",
-    "bg3":     "#21262d",
-    "accent":  "#7c3aed",
+    "bg3":     "#1c2128",
+    "border":  "#30363d",
     "text":    "#e6edf3",
     "dim":     "#8b949e",
-    "green":   "#3fb950",
-    "yellow":  "#d29922",
-    "red":     "#f85149",
-    "blue":    "#58a6ff",
-    "border":  "#30363d",
+    "accent":  "#7c3aed",
+    "used":    "#388bfd",   # blue  — used portion of bar
+    "remain":  "#238636",   # green — remaining portion of bar
+    "limit":   "#2d333b",   # dark  — the empty / limit background
+    "warn":    "#d29922",
+    "danger":  "#da3633",
 }
 
-FONT_MAIN  = ("Segoe UI", 9)
-FONT_BOLD  = ("Segoe UI", 9, "bold")
-FONT_SMALL = ("Segoe UI", 7)
-FONT_BIG   = ("Segoe UI", 18, "bold")
+FS = ("Segoe UI", 7)
+FM = ("Segoe UI", 8)
+FB = ("Segoe UI", 8, "bold")
 
+BAR_W  = 195   # total bar width in px
+BAR_H  = 10    # bar height in px
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  DATA LAYER
+#  DATA
 # ─────────────────────────────────────────────────────────────────────────────
 
-def find_claude_dir() -> Path | None:
-    """Return the Claude Code 'projects' directory for the current OS."""
-    candidates = [
-        # Windows — installed via winget / installer
-        Path(os.environ.get("APPDATA", "")) / "Claude" / "projects",
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Claude" / "projects",
-        # Windows WSL / cross-platform fallback
+def find_claude_dir():
+    for p in [
+        Path(os.environ.get("APPDATA",     "")) / "Claude"  / "projects",
+        Path(os.environ.get("LOCALAPPDATA","")) / "Claude"  / "projects",
         Path.home() / ".claude" / "projects",
-        # macOS
         Path.home() / "Library" / "Application Support" / "Claude" / "projects",
-    ]
-    for p in candidates:
+    ]:
         if p.is_dir():
             return p
     return None
 
 
-def parse_usage(data_dir: Path, today_only: bool = False) -> dict:
-    """
-    Walk all JSONL session files and aggregate token counts.
-    Deduplication is done on the API message ID so that messages stored
-    multiple times (e.g. queue entries) are counted only once.
-    """
-    seen_ids: set[str] = set()
-    totals = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0,
-              "sessions": set(), "messages": 0}
+def parse_usage(data_dir, scope="today"):
+    seen = set()
+    out  = {"input": 0, "output": 0, "cache_write": 0,
+            "cache_read": 0, "sessions": set(), "messages": 0}
     today = date.today().isoformat()
 
-    for jfile in data_dir.rglob("*.jsonl"):
+    files = sorted(data_dir.rglob("*.jsonl"),
+                   key=lambda f: f.stat().st_mtime, reverse=True)
+    if scope == "session":
+        files = files[:1]
+
+    for jf in files:
         try:
-            with open(jfile, encoding="utf-8", errors="replace") as fh:
+            with open(jf, encoding="utf-8", errors="replace") as fh:
                 for raw in fh:
                     raw = raw.strip()
                     if not raw:
                         continue
                     try:
-                        entry = json.loads(raw)
+                        e = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-
-                    msg = entry.get("message")
+                    msg = e.get("message")
                     if not isinstance(msg, dict):
                         continue
-
-                    usage = msg.get("usage")
-                    if not isinstance(usage, dict):
+                    u = msg.get("usage")
+                    if not isinstance(u, dict):
                         continue
-
-                    # Skip if we already counted this API response
-                    msg_id = msg.get("id", "")
-                    if msg_id and msg_id in seen_ids:
+                    mid = msg.get("id", "")
+                    if mid and mid in seen:
                         continue
-                    if msg_id:
-                        seen_ids.add(msg_id)
-
-                    # Date filter
-                    if today_only:
-                        ts = entry.get("timestamp", "")
-                        if not ts.startswith(today):
-                            continue
-
-                    totals["input"]       += usage.get("input_tokens", 0)
-                    totals["output"]      += usage.get("output_tokens", 0)
-                    totals["cache_write"] += usage.get("cache_creation_input_tokens", 0)
-                    totals["cache_read"]  += usage.get("cache_read_input_tokens", 0)
-                    totals["messages"]    += 1
-                    sid = entry.get("sessionId")
+                    if mid:
+                        seen.add(mid)
+                    if scope == "today" and not e.get("timestamp","").startswith(today):
+                        continue
+                    out["input"]       += u.get("input_tokens", 0)
+                    out["output"]      += u.get("output_tokens", 0)
+                    out["cache_write"] += u.get("cache_creation_input_tokens", 0)
+                    out["cache_read"]  += u.get("cache_read_input_tokens", 0)
+                    out["messages"]    += 1
+                    sid = e.get("sessionId")
                     if sid:
-                        totals["sessions"].add(sid)
+                        out["sessions"].add(sid)
         except Exception:
             continue
-
-    return totals
-
-
-def calc_cost(u: dict) -> float:
-    return (
-        u["input"]       * PRICING["input"]       +
-        u["output"]      * PRICING["output"]      +
-        u["cache_write"] * PRICING["cache_write"] +
-        u["cache_read"]  * PRICING["cache_read"]
-    ) / 1_000_000
+    return out
 
 
-def fmt_tok(n: int) -> str:
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.2f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
+def calc_cost(u):
+    return (u["input"]       * PRICING["input"]       +
+            u["output"]      * PRICING["output"]      +
+            u["cache_write"] * PRICING["cache_write"] +
+            u["cache_read"]  * PRICING["cache_read"]) / 1_000_000
+
+def total_tok(u):
+    return u["input"] + u["output"] + u["cache_write"] + u["cache_read"]
+
+def fmt_tok(n):
+    return (f"{n/1e6:.2f}M" if n >= 1_000_000 else
+            f"{n/1000:.0f}K" if n >= 1_000 else str(n))
+
+def fmt_cost(v):
+    return f"${v:.3f}"
+
+def time_to_reset():
+    now   = datetime.now()
+    nxt   = now.replace(hour=RESET_HOUR, minute=0, second=0, microsecond=0)
+    if nxt <= now:
+        nxt += timedelta(days=1)
+    h, r  = divmod(int((nxt - now).total_seconds()), 3600)
+    m, s  = divmod(r, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  MINI PROGRESS BAR WIDGET  (Frame-based — avoids Canvas subclass issues)
+#  SEGMENTED BAR  — shows used (left) + remaining (right) vs limit (bg)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class Bar(tk.Frame):
-    def __init__(self, parent, width=238, **kw):
-        super().__init__(parent, width=width, height=8,
-                         bg=C["bg3"], **kw)
+class SegBar(tk.Frame):
+    """
+    Horizontal bar split into three zones:
+      [== used (blue) ==][-- remaining (green) --][.. over limit (red) ..]
+    """
+    def __init__(self, parent, width=BAR_W, height=BAR_H, **kw):
+        super().__init__(parent, width=width, height=height,
+                         bg=C["limit"], **kw)
         self.pack_propagate(False)
-        self._fill = tk.Frame(self, bg=C["green"], height=8)
-        self._fill.place(x=0, y=0, width=0, height=8)
-        self._width = width
+        self._w = width
+        self._h = height
+        # used segment
+        self._used_f = tk.Frame(self, bg=C["used"])
+        self._used_f.place(x=0, y=0, width=0, height=height)
+        # remaining segment (placed after used)
+        self._rem_f  = tk.Frame(self, bg=C["remain"])
+        self._rem_f.place(x=0, y=0, width=0, height=height)
 
-    def set(self, pct: float):
-        pct = max(0.0, min(1.0, pct))
-        color = (C["green"] if pct < 0.70
-                 else C["yellow"] if pct < 0.90
-                 else C["red"])
-        fw = int(self._width * pct)
-        self._fill.configure(bg=color)
-        self._fill.place(x=0, y=0, width=fw, height=8)
+    def set(self, used_pct, remaining_pct):
+        """
+        used_pct      : fraction of limit already consumed  (0-1)
+        remaining_pct : fraction of limit still available   (0-1)
+        Both clamp to [0,1]; their sum may exceed 1 (handled below).
+        """
+        used_pct      = max(0.0, min(1.0, used_pct))
+        remaining_pct = max(0.0, min(1.0 - used_pct, remaining_pct))
+
+        used_w = int(self._w * used_pct)
+        rem_w  = int(self._w * remaining_pct)
+
+        used_color = (C["danger"] if used_pct >= 0.90 else
+                      C["warn"]   if used_pct >= 0.70 else C["used"])
+        self._used_f.configure(bg=used_color)
+        self._used_f.place(x=0,      y=0, width=used_w, height=self._h)
+        self._rem_f.place( x=used_w, y=0, width=rem_w,  height=self._h)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  MAIN GADGET
+#  GADGET
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ClaudeGadget:
-    W, H = 270, 340
+    W, H = 240, 230
 
     def __init__(self):
-        self.root = tk.Tk()
+        self.root     = tk.Tk()
+        self.data_dir = find_claude_dir()
         self._setup_window()
         self._build_ui()
         self._build_menu()
-        self.data_dir = find_claude_dir()
-        self._refresh()           # first paint, schedules future refreshes
+        self._refresh()
         self.root.mainloop()
 
-    # ── Window setup ──────────────────────────────────────────────────────────
+    # ── window ───────────────────────────────────────────────────────────────
 
     def _setup_window(self):
         r = self.root
         r.title("Claude Usage")
         r.configure(bg=C["bg"])
         r.resizable(False, False)
-
-        # Position: top-right corner, 20 px from edge
         r.update_idletasks()
         sw = r.winfo_screenwidth()
-        r.geometry(f"{self.W}x{self.H}+{sw - self.W - 20}+40")
-
-        # Go frameless after geometry is set (avoids invisible-window bug)
+        r.geometry(f"{self.W}x{self.H}+{sw - self.W - 16}+40")
         r.overrideredirect(True)
         r.attributes("-topmost", True)
-        r.attributes("-alpha", 0.94)
-
-        # Force the window to the front
+        r.attributes("-alpha", 0.95)
         r.lift()
         r.after(100, lambda: r.attributes("-topmost", True))
+        r.bind("<Button-1>",  self._drag_start)
+        r.bind("<B1-Motion>", self._drag_move)
 
-        # Drag support
-        r.bind("<Button-1>",   self._drag_start)
-        r.bind("<B1-Motion>",  self._drag_move)
-
-    # ── UI construction ───────────────────────────────────────────────────────
-
-    def _lbl(self, parent, text="", fg=None, font=None, **kw):
-        return tk.Label(parent, text=text, bg=C["bg"],
-                        fg=fg or C["text"], font=font or FONT_MAIN, **kw)
-
-    def _sep(self, parent):
-        tk.Frame(parent, bg=C["border"], height=1).pack(fill="x", pady=6)
+    # ── ui ───────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        pad = {"padx": 14}
-        root = self.root
+        r = self.root
 
-        # ── Header ──────────────────────────────────────────────────────────
-        hdr = tk.Frame(root, bg=C["bg"])
-        hdr.pack(fill="x", padx=14, pady=(12, 0))
+        # ── header ──────────────────────────────────────────────────────────
+        hdr = tk.Frame(r, bg=C["bg"])
+        hdr.pack(fill="x", padx=10, pady=(8, 0))
+        tk.Label(hdr, text="◈ Claude Code", bg=C["bg"],
+                 fg=C["accent"], font=("Segoe UI", 8, "bold")).pack(side="left")
+        self.lbl_time = tk.Label(hdr, text="", bg=C["bg"],
+                                 fg=C["dim"], font=FS)
+        self.lbl_time.pack(side="right")
 
-        tk.Label(hdr, text="◈", bg=C["bg"], fg=C["accent"],
-                 font=("Segoe UI", 11, "bold")).pack(side="left")
-        tk.Label(hdr, text=" Claude Code", bg=C["bg"], fg=C["text"],
-                 font=("Segoe UI", 10, "bold")).pack(side="left")
-        self.lbl_clock = tk.Label(hdr, text="", bg=C["bg"], fg=C["dim"],
-                                  font=FONT_SMALL)
-        self.lbl_clock.pack(side="right")
+        tk.Frame(r, bg=C["border"], height=1).pack(fill="x", padx=10, pady=(5, 4))
 
-        tk.Frame(root, bg=C["border"], height=1).pack(fill="x", padx=14, pady=(8, 0))
+        body = tk.Frame(r, bg=C["bg"])
+        body.pack(fill="both", expand=True, padx=10)
 
-        body = tk.Frame(root, bg=C["bg"])
-        body.pack(fill="both", expand=True, **pad)
+        # helper: one labelled bar row
+        def bar_row(label, limit_text):
+            """Returns (value_label, bar_widget, right_label)."""
+            row = tk.Frame(body, bg=C["bg"])
+            row.pack(fill="x", pady=(0, 6))
 
-        # ── Today ───────────────────────────────────────────────────────────
-        tk.Label(body, text="TODAY", bg=C["bg"], fg=C["dim"],
-                 font=FONT_SMALL).pack(anchor="w", pady=(8, 0))
+            top = tk.Frame(row, bg=C["bg"])
+            top.pack(fill="x")
+            tk.Label(top, text=label, bg=C["bg"],
+                     fg=C["dim"], font=FS).pack(side="left")
+            rhs = tk.Label(top, text=limit_text, bg=C["bg"],
+                           fg=C["border"], font=FS)
+            rhs.pack(side="right")
 
-        self.lbl_today_cost = tk.Label(body, text="$0.000",
-                                       bg=C["bg"], fg=C["text"], font=FONT_BIG)
-        self.lbl_today_cost.pack(anchor="w")
+            mid = tk.Frame(row, bg=C["bg"])
+            mid.pack(fill="x")
+            val = tk.Label(mid, text="—", bg=C["bg"],
+                           fg=C["text"], font=FB)
+            val.pack(side="left")
+            remain_lbl = tk.Label(mid, text="", bg=C["bg"],
+                                  fg=C["remain"], font=FS)
+            remain_lbl.pack(side="right", anchor="s")
 
-        self.lbl_today_detail = tk.Label(body, text="— tokens  •  — msgs",
-                                         bg=C["bg"], fg=C["dim"], font=FONT_SMALL)
-        self.lbl_today_detail.pack(anchor="w")
+            bar = SegBar(row, width=BAR_W)
+            bar.pack(anchor="w", pady=(3, 0))
 
-        self.bar_today = Bar(body, width=242)
-        self.bar_today.pack(anchor="w", pady=5)
+            return val, remain_lbl, bar
 
-        self.lbl_limit_caption = tk.Label(
-            body, text=f"Monthly budget: ${MONTHLY_COST_LIMIT_USD:.0f}",
-            bg=C["bg"], fg=C["dim"], font=FONT_SMALL)
-        self.lbl_limit_caption.pack(anchor="w")
+        # ── COST row ─────────────────────────────────────────────────────────
+        tk.Label(body, text="COST", bg=C["bg"],
+                 fg=C["dim"], font=FS).pack(anchor="w")
+        cost_row = tk.Frame(body, bg=C["bg"])
+        cost_row.pack(fill="x")
+        self.lbl_cost = tk.Label(cost_row, text="$0.000", bg=C["bg"],
+                                 fg=C["used"], font=("Segoe UI", 13, "bold"))
+        self.lbl_cost.pack(side="left")
+        self.lbl_cost_rem = tk.Label(cost_row, text="", bg=C["bg"],
+                                     fg=C["remain"], font=FS)
+        self.lbl_cost_rem.pack(side="right", anchor="s", pady=(0, 2))
+        self.bar_cost = SegBar(body, width=BAR_W)
+        self.bar_cost.pack(anchor="w", pady=(3, 0))
+        self.lbl_cost_caption = tk.Label(
+            body, text=f"limit: ${MONTHLY_COST_LIMIT:.0f} / month",
+            bg=C["bg"], fg=C["border"], font=FS)
+        self.lbl_cost_caption.pack(anchor="w")
 
-        tk.Frame(body, bg=C["border"], height=1).pack(fill="x", pady=(10, 0))
+        tk.Frame(body, bg=C["border"], height=1).pack(fill="x", pady=(6, 4))
 
-        # ── Token breakdown ─────────────────────────────────────────────────
-        tk.Label(body, text="ALL TIME", bg=C["bg"], fg=C["dim"],
-                 font=FONT_SMALL).pack(anchor="w", pady=(8, 2))
+        # ── TOKENS row ───────────────────────────────────────────────────────
+        tk.Label(body, text="TOKENS  (today)", bg=C["bg"],
+                 fg=C["dim"], font=FS).pack(anchor="w")
+        tok_row = tk.Frame(body, bg=C["bg"])
+        tok_row.pack(fill="x")
+        self.lbl_tok_used = tk.Label(tok_row, text="—", bg=C["bg"],
+                                     fg=C["used"], font=FB)
+        self.lbl_tok_used.pack(side="left")
+        self.lbl_tok_rem = tk.Label(tok_row, text="", bg=C["bg"],
+                                    fg=C["remain"], font=FS)
+        self.lbl_tok_rem.pack(side="right", anchor="s")
+        self.bar_tok = SegBar(body, width=BAR_W)
+        self.bar_tok.pack(anchor="w", pady=(3, 0))
+        self.lbl_tok_caption = tk.Label(
+            body, text=f"limit: {fmt_tok(DAILY_TOKEN_LIMIT)} / day",
+            bg=C["bg"], fg=C["border"], font=FS)
+        self.lbl_tok_caption.pack(anchor="w")
 
-        grid = tk.Frame(body, bg=C["bg"])
-        grid.pack(fill="x")
+        tk.Frame(body, bg=C["border"], height=1).pack(fill="x", pady=(6, 4))
 
-        def row(label, color=C["text"]):
-            f = tk.Frame(grid, bg=C["bg"])
-            f.pack(fill="x", pady=1)
-            tk.Label(f, text=label, bg=C["bg"], fg=C["dim"],
-                     font=FONT_SMALL, width=14, anchor="w").pack(side="left")
-            v = tk.Label(f, text="—", bg=C["bg"], fg=color,
-                         font=("Segoe UI", 8, "bold"))
-            v.pack(side="right")
-            return v
+        # ── bottom row: reset + session ───────────────────────────────────────
+        bot = tk.Frame(body, bg=C["bg"])
+        bot.pack(fill="x")
 
-        self.lbl_total_cost    = row("Total cost",    C["blue"])
-        self.lbl_input_tok     = row("Input tokens",  C["text"])
-        self.lbl_output_tok    = row("Output tokens", C["text"])
-        self.lbl_cache_write   = row("Cache created", C["dim"])
-        self.lbl_cache_read    = row("Cache hits",    C["green"])
-        self.lbl_sessions      = row("Sessions",      C["text"])
+        tk.Label(bot, text="Reset", bg=C["bg"],
+                 fg=C["dim"], font=FS).pack(side="left")
+        self.lbl_reset = tk.Label(bot, text="—", bg=C["bg"],
+                                  fg=C["warn"], font=FB)
+        self.lbl_reset.pack(side="left", padx=(4, 0))
 
-        tk.Frame(body, bg=C["border"], height=1).pack(fill="x", pady=(10, 0))
+        self.lbl_sess = tk.Label(bot, text="", bg=C["bg"],
+                                 fg=C["dim"], font=FS)
+        self.lbl_sess.pack(side="right")
 
-        # ── Status ──────────────────────────────────────────────────────────
-        self.lbl_status = tk.Label(body, text="Starting…",
-                                   bg=C["bg"], fg=C["dim"], font=FONT_SMALL,
-                                   wraplength=240, justify="left")
-        self.lbl_status.pack(anchor="w", pady=(6, 0))
+        # status
+        self.lbl_status = tk.Label(body, text="", bg=C["bg"],
+                                   fg=C["border"], font=FS)
+        self.lbl_status.pack(anchor="w", pady=(4, 4))
 
-        # ── Footer hint ─────────────────────────────────────────────────────
-        tk.Label(root, text="right-click for options  •  drag to move",
-                 bg=C["bg"], fg=C["border"], font=("Segoe UI", 6)).pack(pady=(4, 6))
+        # ── legend ────────────────────────────────────────────────────────────
+        leg = tk.Frame(r, bg=C["bg2"])
+        leg.pack(fill="x")
+        for color, label in [(C["used"], "used"), (C["remain"], "remaining"),
+                             (C["limit"], "limit")]:
+            tk.Frame(leg, bg=color, width=10, height=10).pack(
+                side="left", padx=(8, 2), pady=4)
+            tk.Label(leg, text=label, bg=C["bg2"],
+                     fg=C["dim"], font=FS).pack(side="left", padx=(0, 6))
 
-    # ── Context menu ──────────────────────────────────────────────────────────
+    # ── menu ─────────────────────────────────────────────────────────────────
 
     def _build_menu(self):
         m = tk.Menu(self.root, tearoff=0, bg=C["bg2"], fg=C["text"],
                     activebackground=C["accent"], activeforeground=C["text"],
-                    font=FONT_MAIN)
-        m.add_command(label="⟳  Refresh now",   command=self._refresh_now)
+                    font=FM)
+        m.add_command(label="Refresh now",      command=self._refresh_now)
         m.add_separator()
-        m.add_command(label="📂  Open data folder", command=self._open_data_dir)
+        m.add_command(label="Open data folder", command=self._open_dir)
         m.add_separator()
-        m.add_command(label="✕  Exit",           command=self.root.destroy)
+        m.add_command(label="Exit",             command=self.root.destroy)
         self.menu = m
-        self.root.bind("<Button-3>", self._show_menu)
+        self.root.bind("<Button-3>",
+                       lambda e: m.tk_popup(e.x_root, e.y_root))
 
-    def _show_menu(self, event):
-        self.menu.tk_popup(event.x_root, event.y_root)
-
-    def _open_data_dir(self):
+    def _open_dir(self):
         if self.data_dir and self.data_dir.exists():
-            os.startfile(str(self.data_dir))  # Windows explorer
+            os.startfile(str(self.data_dir))
 
-    # ── Drag ─────────────────────────────────────────────────────────────────
+    # ── drag ─────────────────────────────────────────────────────────────────
 
     def _drag_start(self, e):
         self._ox, self._oy = e.x, e.y
@@ -330,66 +361,63 @@ class ClaudeGadget:
         y = self.root.winfo_y() + (e.y - self._oy)
         self.root.geometry(f"+{x}+{y}")
 
-    # ── Refresh logic ────────────────────────────────────────────────────────
+    # ── refresh ───────────────────────────────────────────────────────────────
 
     def _refresh_now(self):
-        """Cancel pending timer and refresh immediately."""
-        if hasattr(self, "_after_id"):
-            self.root.after_cancel(self._after_id)
+        if hasattr(self, "_aid"):
+            self.root.after_cancel(self._aid)
         self._refresh()
 
     def _refresh(self):
-        from datetime import datetime
-        now_str = datetime.now().strftime("%H:%M:%S")
-        self.lbl_clock.config(text=now_str)
+        now = datetime.now().strftime("%H:%M")
+        self.lbl_time.config(text=now)
+        self.lbl_reset.config(text=time_to_reset())
 
         if not self.data_dir:
-            self.lbl_status.config(
-                text="⚠ Claude data folder not found.\n"
-                     "Make sure Claude Code is installed.")
-            self._after_id = self.root.after(REFRESH_INTERVAL_MS, self._refresh)
+            self.lbl_status.config(text="Claude data folder not found")
+            self._aid = self.root.after(REFRESH_INTERVAL_MS, self._refresh)
             return
 
         try:
-            today   = parse_usage(self.data_dir, today_only=True)
-            alltime = parse_usage(self.data_dir, today_only=False)
+            today   = parse_usage(self.data_dir, "today")
+            session = parse_usage(self.data_dir, "session")
 
-            today_cost  = calc_cost(today)
-            all_cost    = calc_cost(alltime)
-            today_total = (today["input"] + today["output"] +
-                           today["cache_write"] + today["cache_read"])
+            today_cost   = calc_cost(today)
+            session_cost = calc_cost(session)
+            today_tok    = total_tok(today)
+            remaining_tok = max(0, DAILY_TOKEN_LIMIT - today_tok)
+            remaining_cost = max(0.0, MONTHLY_COST_LIMIT - today_cost)
 
-            # Today panel
-            cost_color = (C["green"] if today_cost < MONTHLY_COST_LIMIT_USD * 0.7
-                          else C["yellow"] if today_cost < MONTHLY_COST_LIMIT_USD * 0.9
-                          else C["red"])
-            self.lbl_today_cost.config(text=f"${today_cost:.3f}", fg=cost_color)
-            self.lbl_today_detail.config(
-                text=f"{fmt_tok(today_total)} tokens  •  {today['messages']} messages")
-            self.bar_today.set(today_cost / MONTHLY_COST_LIMIT_USD)
+            # cost bar
+            used_cost_pct = today_cost / MONTHLY_COST_LIMIT if MONTHLY_COST_LIMIT else 0
+            rem_cost_pct  = remaining_cost / MONTHLY_COST_LIMIT if MONTHLY_COST_LIMIT else 0
+            cost_col = (C["danger"] if used_cost_pct >= 0.90 else
+                        C["warn"]   if used_cost_pct >= 0.70 else C["used"])
+            self.lbl_cost.config(text=fmt_cost(today_cost), fg=cost_col)
+            self.lbl_cost_rem.config(text=f"{fmt_cost(remaining_cost)} left")
+            self.bar_cost.set(used_cost_pct, rem_cost_pct)
 
-            # All-time table
-            self.lbl_total_cost.config(text=f"${all_cost:.3f}")
-            self.lbl_input_tok.config(text=fmt_tok(alltime["input"]))
-            self.lbl_output_tok.config(text=fmt_tok(alltime["output"]))
-            self.lbl_cache_write.config(text=fmt_tok(alltime["cache_write"]))
-            self.lbl_cache_read.config(text=fmt_tok(alltime["cache_read"]))
-            self.lbl_sessions.config(text=str(len(alltime["sessions"])))
+            # token bar
+            used_tok_pct = today_tok / DAILY_TOKEN_LIMIT if DAILY_TOKEN_LIMIT else 0
+            rem_tok_pct  = remaining_tok / DAILY_TOKEN_LIMIT if DAILY_TOKEN_LIMIT else 0
+            tok_col = (C["danger"] if used_tok_pct >= 0.90 else
+                       C["warn"]   if used_tok_pct >= 0.70 else C["used"])
+            self.lbl_tok_used.config(text=fmt_tok(today_tok), fg=tok_col)
+            self.lbl_tok_rem.config(text=f"{fmt_tok(remaining_tok)} left")
+            self.bar_tok.set(used_tok_pct, rem_tok_pct)
 
-            jfiles = list(self.data_dir.rglob("*.jsonl"))
-            self.lbl_status.config(
-                text=f"✓ Watching {len(jfiles)} session file(s)  "
-                     f"•  next refresh in 60 s")
+            # sessions + status
+            n_sess = len(today["sessions"])
+            self.lbl_sess.config(
+                text=f"{n_sess} session(s)  |  {fmt_cost(session_cost)} this session")
+            self.lbl_status.config(text=f"updated {now}")
 
         except Exception as exc:
-            self.lbl_status.config(text=f"⚠ {exc}")
+            self.lbl_status.config(text=f"Error: {exc}")
 
-        # Schedule next refresh — no threads, minimal CPU
-        self._after_id = self.root.after(REFRESH_INTERVAL_MS, self._refresh)
+        self._aid = self.root.after(REFRESH_INTERVAL_MS, self._refresh)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
