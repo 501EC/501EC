@@ -191,6 +191,8 @@ class ClaudeGadget:
         self._build_ui()
         self._build_menu()
         self._refresh()
+        # Delay sink so window is fully visible before Win32 calls
+        self.root.after(800, self._sink_to_desktop)
         self.root.mainloop()
 
     # ── window ───────────────────────────────────────────────────────────────
@@ -204,29 +206,31 @@ class ClaudeGadget:
         sw = r.winfo_screenwidth()
         r.geometry(f"{self.W}x{self.H}+{sw - self.W - 16}+40")
         r.overrideredirect(True)
-        r.attributes("-topmost", False)   # NOT always on top
+        r.attributes("-topmost", False)
         r.attributes("-alpha", 0.95)
         r.update()
-        self._sink_to_desktop()           # hide from taskbar + sit behind apps
         r.bind("<Button-1>",  self._drag_start)
         r.bind("<B1-Motion>", self._drag_move)
-        r.bind("<ButtonRelease-1>", lambda e: self._sink_to_desktop())
+        r.bind("<ButtonRelease-1>", lambda e: self.root.after(100, self._sink_to_desktop))
 
     def _sink_to_desktop(self):
         """
-        Use Win32 API to:
-          1. Hide the window from the taskbar and Alt+Tab (WS_EX_TOOLWINDOW).
-          2. Send it to the bottom of the z-order so every app window sits above it.
-        This makes the gadget behave like a desktop widget — visible only
-        when no other window is covering the desktop area.
+        Send window behind all app windows using Win32 API.
+        Called once after startup and re-applied every 3 s so it stays at
+        the bottom even if Windows briefly raises it.
         """
         try:
             import ctypes
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            # Try FindWindowW first (most reliable with overrideredirect)
+            hwnd = ctypes.windll.user32.FindWindowW(None, "Claude Usage")
+            if not hwnd:
+                hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
             if not hwnd:
                 hwnd = self.root.winfo_id()
+            if not hwnd:
+                return
 
-            # --- hide from taskbar ---
+            # Hide from taskbar and Alt+Tab
             GWL_EXSTYLE      = -20
             WS_EX_TOOLWINDOW = 0x00000080
             WS_EX_APPWINDOW  = 0x00040000
@@ -235,7 +239,7 @@ class ClaudeGadget:
                 hwnd, GWL_EXSTYLE,
                 (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW)
 
-            # --- send to bottom of z-order (behind all app windows) ---
+            # Send behind all normal windows (desktop level)
             HWND_BOTTOM    = 1
             SWP_NOMOVE     = 0x0002
             SWP_NOSIZE     = 0x0001
@@ -244,7 +248,10 @@ class ClaudeGadget:
                 hwnd, HWND_BOTTOM, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
         except Exception:
-            pass   # non-Windows platform — silently skip
+            pass
+
+        # Re-apply every 3 seconds to stay at the bottom
+        self.root.after(3000, self._sink_to_desktop)
 
     # ── ui ───────────────────────────────────────────────────────────────────
 
@@ -404,7 +411,11 @@ class ClaudeGadget:
         self.lbl_reset.config(text=time_to_reset())
 
         if not self.data_dir:
-            self.lbl_status.config(text="Claude data folder not found")
+            # Show exactly where we looked so user can diagnose
+            appdata = os.environ.get("APPDATA", "?")
+            self.lbl_status.config(
+                text=f"No data found.\nLooked in: {appdata}\\Claude\\projects\\"
+                     f"\nInstall Claude Code CLI or run a session first.")
             self._aid = self.root.after(REFRESH_INTERVAL_MS, self._refresh)
             return
 
@@ -437,10 +448,13 @@ class ClaudeGadget:
             self.bar_tok.set(used_tok_pct, rem_tok_pct)
 
             # sessions + status
-            n_sess = len(today["sessions"])
+            n_sess  = len(today["sessions"])
+            n_files = len(list(self.data_dir.rglob("*.jsonl")))
             self.lbl_sess.config(
                 text=f"{n_sess} session(s)  |  {fmt_cost(session_cost)} this session")
-            self.lbl_status.config(text=f"updated {now}")
+            self.lbl_status.config(
+                text=f"updated {now}  •  {n_files} file(s)"
+                if n_files else f"updated {now}  •  no session files yet")
 
         except Exception as exc:
             self.lbl_status.config(text=f"Error: {exc}")
