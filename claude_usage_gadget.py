@@ -147,43 +147,26 @@ def fmt_tok(n: int) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  MINI PROGRESS BAR WIDGET
+#  MINI PROGRESS BAR WIDGET  (Frame-based — avoids Canvas subclass issues)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class Bar(tk.Canvas):
-    H = 6
-    R = 3
-
+class Bar(tk.Frame):
     def __init__(self, parent, width=238, **kw):
-        super().__init__(parent, width=width, height=self.H,
-                         bg=C["bg"], highlightthickness=0, **kw)
-        self._w = width
-        self._pct = 0.0
+        super().__init__(parent, width=width, height=8,
+                         bg=C["bg3"], **kw)
+        self.pack_propagate(False)
+        self._fill = tk.Frame(self, bg=C["green"], height=8)
+        self._fill.place(x=0, y=0, width=0, height=8)
+        self._width = width
 
     def set(self, pct: float):
-        self._pct = max(0.0, min(1.0, pct))
-        self._draw()
-
-    def _draw(self):
-        self.delete("all")
-        w, h, r = self._w, self.H, self.R
-        self._rrect(0, 0, w, h, r, fill=C["bg3"])
-        if self._pct > 0:
-            fw = max(2 * r, int(w * self._pct))
-            color = (C["green"] if self._pct < 0.70
-                     else C["yellow"] if self._pct < 0.90
-                     else C["red"])
-            self._rrect(0, 0, fw, h, r, fill=color)
-
-    def _rrect(self, x1, y1, x2, y2, r, **kw):
-        kw.setdefault("outline", "")
-        arc_kw = {**kw, "style": "pieslice"}
-        self.create_arc(x1, y1, x1+2*r, y1+2*r, start=90,  extent=90, **arc_kw)
-        self.create_arc(x2-2*r, y1, x2, y1+2*r, start=0,   extent=90, **arc_kw)
-        self.create_arc(x1, y2-2*r, x1+2*r, y2, start=180, extent=90, **arc_kw)
-        self.create_arc(x2-2*r, y2-2*r, x2, y2, start=270, extent=90, **arc_kw)
-        self.create_rectangle(x1+r, y1, x2-r, y2, **kw)
-        self.create_rectangle(x1, y1+r, x2, y2-r, **kw)
+        pct = max(0.0, min(1.0, pct))
+        color = (C["green"] if pct < 0.70
+                 else C["yellow"] if pct < 0.90
+                 else C["red"])
+        fw = int(self._width * pct)
+        self._fill.configure(bg=color)
+        self._fill.place(x=0, y=0, width=fw, height=8)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,7 +254,7 @@ class ClaudeGadget:
         self.lbl_today_detail.pack(anchor="w")
 
         self.bar_today = Bar(body, width=242)
-        self.bar_today.pack(anchor="w", pady=(5, 2))
+        self.bar_today.pack(anchor="w", pady=5)
 
         self.lbl_limit_caption = tk.Label(
             body, text=f"Monthly budget: ${MONTHLY_COST_LIMIT_USD:.0f}",
