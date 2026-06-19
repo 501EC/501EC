@@ -154,8 +154,8 @@ class SegBar(tk.Frame):
         super().__init__(parent, width=width, height=height,
                          bg=C["limit"], **kw)
         self.pack_propagate(False)
-        self._w = width
-        self._h = height
+        self._bar_w = width
+        self._bar_h = height
         # used segment
         self._used_f = tk.Frame(self, bg=C["used"])
         self._used_f.place(x=0, y=0, width=0, height=height)
@@ -164,16 +164,11 @@ class SegBar(tk.Frame):
         self._rem_f.place(x=0, y=0, width=0, height=height)
 
     def set(self, used_pct, remaining_pct):
-        """
-        used_pct      : fraction of limit already consumed  (0-1)
-        remaining_pct : fraction of limit still available   (0-1)
-        Both clamp to [0,1]; their sum may exceed 1 (handled below).
-        """
         used_pct      = max(0.0, min(1.0, used_pct))
         remaining_pct = max(0.0, min(1.0 - used_pct, remaining_pct))
 
-        used_w = int(self._w * used_pct)
-        rem_w  = int(self._w * remaining_pct)
+        used_w = int(self._bar_w * used_pct)
+        rem_w  = int(self._bar_w * remaining_pct)
 
         used_color = (C["danger"] if used_pct >= 0.90 else
                       C["warn"]   if used_pct >= 0.70 else C["used"])
